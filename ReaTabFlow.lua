@@ -1,5 +1,5 @@
 -- @description ReaTabFlow - Guitar tablature on MIDI tracks
--- @version 1.1
+-- @version 1.2
 -- @about Display tablature in the arrange view for tracks selected when the action starts.
 local r = reaper
 local floor, ceil, min, max = math.floor, math.ceil, math.min, math.max
@@ -42,7 +42,7 @@ local function assignChord(notes, first, last, busy, position)
   local total, count = 0, 0
   while best.parent do
     if best.row then
-      chord[best.row] = best.fret
+      chord[best.row] = {fret = best.fret, stop = best.note.stop}
       busy[best.row] = best.note.stop
       if best.fret > 0 then total, count = total + best.fret, count + 1 end
     else
@@ -62,7 +62,7 @@ local function importedChord(notes, first, last, strings, topChannel)
     local row = topChannel - note.channel + 1
     local openPitch = strings[#strings - row + 1]
     if openPitch and note.pitch >= openPitch and chord[row] == nil then
-      chord[row] = note.pitch - openPitch
+      chord[row] = {fret = note.pitch - openPitch, stop = note.stop}
     else
       chord.missed = chord.missed + 1
     end
@@ -108,14 +108,23 @@ local function readChords(take, transpose, strings, topChannel)
     return a.index < b.index
   end)
   local chords, busy, position, first = {}, {}, 1, 1
+  local latestStop = -math.huge
   while first <= #notes do
     local last = first
     while last < #notes and notes[last + 1].start == notes[first].start do last = last + 1 end
+    local chord
     if strings then
-      chords[#chords + 1] = importedChord(notes, first, last, strings, topChannel)
+      chord = importedChord(notes, first, last, strings, topChannel)
     else
-      chords[#chords + 1], position = assignChord(notes, first, last, busy, position)
+      chord, position = assignChord(notes, first, last, busy, position)
     end
+    -- Include earlier chords whose notes still ring at the left edge of the view.
+    latestStop = max(latestStop, chord.start)
+    for row = 1, #(strings or tuning) do
+      if chord[row] then latestStop = max(latestStop, chord[row].stop) end
+    end
+    chord.latestStop = latestStop
+    chords[#chords + 1] = chord
     first = last + 1
   end
   return chords
@@ -133,11 +142,11 @@ local function sourceTicks(take)
   return tick
 end
 
-local function lowerBound(chords, tick)
+local function firstVisibleChord(chords, tick)
   local lo, hi = 1, #chords + 1
   while lo < hi do
     local mid = floor((lo + hi) / 2)
-    if chords[mid].start < tick then lo = mid + 1 else hi = mid end
+    if chords[mid].latestStop < tick then lo = mid + 1 else hi = mid end
   end
   return lo
 end
@@ -151,12 +160,13 @@ local function visibleChords(model, take, fromTime, toTime, looped, zoom, draw)
   local final = period > 0 and floor(right / period) or 0
   while cycle <= final do
     local shift = cycle * period
-    local i = lowerBound(model.chords, left - shift - 1e-7)
+    local leftTick = left - shift
+    local rightTick = min(right - shift, period > 0 and period or math.huge)
+    local i = firstVisibleChord(model.chords, leftTick - 1e-7)
     while i <= #model.chords do
       local chord = model.chords[i]
-      local tick = shift + chord.start
-      if tick >= right - 1e-7 or (period > 0 and chord.start >= period) then break end
-      draw(chord, r.MIDI_GetProjTimeFromPPQPos(take, tick))
+      if chord.start >= rightTick - 1e-7 then break end
+      draw(chord, shift, leftTick, rightTick)
       i = i + 1
     end
     if cycle == final then break end
@@ -228,7 +238,8 @@ local function drawStaff(o, take, view, top, height, start, stop, looped, select
     return
   end
   local step = min(24, (height - 9) / rows)
-  local size = max(7, min(19, floor(step)))
+  local barHeight = step >= 14 and 2 or 1
+  local size = min(19, floor(step) - barHeight)
   local font = getFont(size)
   local firstY = top - o.y + floor((height - (rows - 1) * step) / 2)
   local function xAt(t) return floor((t - view.start) * view.zoom + 0.5) - o.x end
@@ -243,25 +254,34 @@ local function drawStaff(o, take, view, top, height, start, stop, looped, select
     local _, nextMeasure = r.TimeMap2_timeToBeats(project, barTime + 8 / view.zoom)
     measure = max(measure + 1, nextMeasure)
   end
+  local labelY = {}
   for row = 1, rows do
-    rect(bitmap, 0, floor(firstY + (row - 1) * step), w, 1, 0xff778993)
+    labelY[row] = floor(firstY + (row - 1) * step - (size + barHeight) / 2)
+    rect(bitmap, 0, labelY[row] + floor(size / 2), w, 1, 0xff778993)
   end
   local lastEnd = {}
   r.JS_LICE_SetFontColor(font, 0xfff6f5eb)
-  visibleChords(o.model, take, from, to, looped, view.zoom, function(chord, time)
-    local x = max(0, xAt(time))
+  visibleChords(o.model, take, from, to, looped, view.zoom, function(chord, shift, leftTick, rightTick)
+    local onsetVisible = chord.start >= leftTick - 1e-7
+    local x = max(0, xAt(r.MIDI_GetProjTimeFromPPQPos(take, shift + max(chord.start, leftTick))))
     for row = 1, rows do
-      local fret = chord[row]
-      if fret and x >= (lastEnd[row] or 0) then
-        local label = tostring(fret)
+      local note = chord[row]
+      local y = labelY[row]
+      if note and onsetVisible and x >= (lastEnd[row] or 0) then
+        local label = tostring(note.fret)
         local width = ceil(size * 0.65 * #label) + 2
-        local y = floor(firstY + (row - 1) * step - size / 2)
-        rect(bitmap, x, y, width, size + 1, bg)
+        rect(bitmap, x, y, width, size, bg)
         r.JS_LICE_DrawText(bitmap, font, label, #label, x + 1, y, x + width + 1, y + size + 3)
         lastEnd[row] = x + width
       end
+      if note and note.stop > max(chord.start, leftTick) and x < w then
+        local endTime = r.MIDI_GetProjTimeFromPPQPos(take, shift + min(note.stop, rightTick))
+        local endX = min(w, max(x + 1, xAt(endTime)))
+        rect(bitmap, x, y + size, endX - x, barHeight, 0xff54c7af)
+        if onsetVisible then rect(bitmap, x, y + size, 1, barHeight, 0xffaff1db) end
+      end
     end
-    if chord.missed > 0 then
+    if chord.missed > 0 and onsetVisible then
       rect(bitmap, x + 1, firstY - floor(size / 2) - 4, 4, 3, 0xffffac56)
     end
   end)
